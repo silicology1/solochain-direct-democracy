@@ -1,232 +1,149 @@
-# Substrate Node Template
+# solochain-direct-democracy
 
-A fresh [Substrate](https://substrate.io/) node, ready for hacking :rocket:
+A Polkadot SDK solochain implementing **gasless multi-winner STAR voting**
+(Score Then Automatic Runoff, Phase 1 — no proving system yet), with an
+off-chain tally service (`tally-client/`) that computes results from chain
+state and posts a tamper-evident result hash on-chain.
 
-A standalone version of this template is available for each release of Polkadot
-in the [Substrate Developer Hub Parachain
-Template](https://github.com/substrate-developer-hub/substrate-node-template/)
-repository. The parachain template is generated directly at each Polkadot
-release branch from the [Solochain Template in
-Substrate](https://github.com/paritytech/polkadot-sdk/tree/master/templates/solochain)
-upstream
+Built on the [Polkadot SDK solochain
+template](https://github.com/paritytech/polkadot-sdk/tree/master/templates/solochain).
 
-It is usually best to use the stand-alone version to start a new project. All
-bugs, suggestions, and feature requests should be made upstream in the
-[Substrate](https://github.com/paritytech/polkadot-sdk/tree/master/substrate)
-repository.
+## How it works
 
-## Getting Started
-
-Depending on your operating system and Rust version, there might be additional
-packages required to compile this template. Check the
-[Install](https://docs.substrate.io/install/) instructions for your platform for
-the most common dependencies. Alternatively, you can use one of the [alternative
-installation](#alternatives-installations) options.
-
-Fetch solochain template code:
-
-```sh
-git clone https://github.com/paritytech/polkadot-sdk-solochain-template.git solochain-template
-
-cd solochain-template
 ```
+voters (feeless)             tally service (off-chain)          chain (sudo)
+┌───────────────────┐        ┌──────────────────────────┐       ┌──────────────────────┐
+│ StarVoting::vote  │──────▶ │ read Ballots from state  │       │ StarVoting::submit_  │
+│ scores −5..+5     │        │ run STAR tally locally   │─────▶ │ tally(winners,totals)│
+│ or abstain        │        │ (top-W by real total)    │ sudo  │  → recomputes hash   │
+└───────────────────┘        └──────────────────────────┘       │  → binds Tally(id)   │
+                                                               └──────────────────────┘
+                                        anyone: re-derive hash from ballots & compare
+```
+
+- **Ballots** are stored per `(election, voter)` as one score offset per
+  candidate: `raw score + 5` (so `-5..=+5` → `0..=10`), with `255` meaning
+  *deliberate abstention*. Abstentions are excluded from both the total and
+  the voter count, keeping each voter's score scale comparable.
+- **Tally rule** (Phase 1): candidates are ranked by their *real* signed
+  total `offset_total − 5·voter_count`, not by the offset total; ties are
+  broken by the smaller candidate id. The top `winner_count` candidates win.
+- **Result binding**: the pallet recomputes, on-chain, over whatever
+  `submit_tally` receives:
+  `result_hash = blake2_256(scale_encode((election_id, winner_count, winners, totals)))`.
+  Anyone can independently recompute this from the ballots and compare with
+  the stored `Tally.result_hash` — `star-voting-tally verify` does exactly
+  that (cross-checked by unit tests on both sides).
+- **Gasless voting**: the pallet marks `vote` with
+  `#[pallet::feeless_if]` and the runtime wraps `ChargeTransactionPayment`
+  with `pallet_skip_feeless_payment::SkipCheckIfFeeless`, so casting a
+  ballot never charges a fee.
+
+> **Phase 1 scope**: the tally service is trusted-but-auditable (the stored
+> hash binds whatever was submitted, and `verify` lets anyone check it).
+> Later phases will replace the trusted submitter with validity proofs
+> (STARK/Stwo) of correct tallying.
+
+## Project layout
+
+| Path | What it is |
+| --- | --- |
+| `pallets/star-voting/` | The FRAME pallet: elections, ballots, tally submission |
+| `runtime/` | The runtime wiring the pallet (index 7) and `SkipFeelessPayment` (index 8) |
+| `node/` | The solochain node (Aura + GRANDPA, RPC) |
+| `tally-client/` | Standalone off-chain tally service (subxt, static codegen) — see [its README](./tally-client/README.md) for metadata regeneration and CLI details |
+
+## Getting started
+
+Prerequisites: a working [Rust toolchain pinned by
+`rust-toolchain.toml`](https://docs.polkadot.com/develop/_install/),
+`protobuf-compiler` (for the node build), and `git`.
 
 ### Build
 
-🔨 Use the following command to build the node without launching it:
-
 ```sh
-cargo build --release
+cargo build --release            # node + runtime + pallet
+cargo build -p star-voting-tally-client --manifest-path tally-client/Cargo.toml  # tally service
 ```
 
-### Embedded Docs
+Note: `tally-client/` is its own workspace (own `Cargo.lock`) so the subxt
+dependency stack never enters the node build.
 
-After you build the project, you can use the following command to explore its
-parameters and subcommands:
-
-```sh
-./target/release/solochain-template-node -h
-```
-
-You can generate and view the [Rust
-Docs](https://doc.rust-lang.org/cargo/commands/cargo-doc.html) for this template
-with this command:
+### Run a development chain
 
 ```sh
-cargo +nightly doc --open
+./target/release/solochain-template-node --dev --tmp
 ```
 
-### Single-Node Development Chain
+Dev chains use **Alice** and **Bob** as validators with several pre-funded
+accounts, and **Alice** as the `sudo` account (which Phase 1 needs, see
+below). State persists in a temp dir for the lifetime of the process; use
+`--base-path ./my-chain-state/` to keep it.
 
-The following command starts a single-node development chain that doesn't
-persist state:
+### Tests
 
 ```sh
-./target/release/solochain-template-node --dev
+cargo test -p pallet-star-voting                 # pallet logic (incl. digest vector)
+cargo test --manifest-path tally-client/Cargo.toml  # tally algorithm + digest cross-check
 ```
 
-To purge the development chain's state, run the following command:
+## Using the system
+
+### 1. Create an election and vote (on-chain)
+
+Extrinsics (pallet `StarVoting`):
+
+- `create_election(winner_count, candidates, voting_period)` — 5..=500
+  winners, at least that many unique candidates.
+- `vote(election_id, scores)` — one offset per candidate; **feeless**.
+
+### 2. Tally and submit (off-chain client)
 
 ```sh
-./target/release/solochain-template-node purge-chain --dev
+cargo run --manifest-path tally-client/Cargo.toml -- create --winners 5 --candidates 1,2,3,4,5
+cargo run --manifest-path tally-client/Cargo.toml -- vote 0 --seed //Alice 5,-2,0,a,3   # a = abstain
+cargo run --manifest-path tally-client/Cargo.toml -- vote 0 --seed //Bob   5,5,5,5,5
+cargo run --manifest-path tally-client/Cargo.toml -- tally 0                            # via sudo
+cargo run --manifest-path tally-client/Cargo.toml -- verify 0                           # recompute & check
+cargo run --manifest-path tally-client/Cargo.toml -- watch                              # daemon
 ```
 
-To start the development chain with detailed logging, run the following command:
+The client uses subxt **static codegen** compiled from
+[tally-client/artifacts/metadata.scale](./tally-client/README.md#regenerating-artifactsmetadata_scale).
+Whenever the runtime changes, bump `spec_version` and regenerate that
+artifact — the exact procedure is in the
+[client README](./tally-client/README.md).
 
-```sh
-RUST_BACKTRACE=1 ./target/release/solochain-template-node -ldebug --dev
-```
+### Sudo note (Phase 1)
 
-Development chains:
+`TallyOrigin` is currently `EnsureRoot`, so `submit_tally` must be wrapped
+in `Sudo::sudo` by the sudo account (`//Alice` on dev chains) — this is the
+default behavior of `tally`/`watch`. Use `tally --no-sudo` for runtimes
+whose `TallyOrigin` accepts signed accounts.
 
-- Maintain state in a `tmp` folder while the node is running.
-- Use the **Alice** and **Bob** accounts as default validator authorities.
-- Use the **Alice** account as the default `sudo` account.
-- Are preconfigured with a genesis state (`/node/src/chain_spec.rs`) that
-  includes several pre-funded development accounts.
+## Runtime details
 
+- Pallet indices: `7` = `StarVoting`, `8` = `SkipFeelessPayment` (wraps
+  `ChargeTransactionPayment` in the `TxExtension` to honor `feeless_if`).
+- The digest payload (`election_id, winner_count, winners, totals`) is
+  identical on-chain (`pallets/star-voting/src/lib.rs::compute_result_hash`)
+  and off-chain (`tally-client/src/digest.rs`); both sides are pinned by
+  tests against the same vector. Keep them in sync.
+- Weights are hand-estimated placeholders in
+  `pallets/star-voting/src/weights.rs`; regenerate from benchmarks
+  (`pallets/star-voting/src/benchmarking.rs`,
+  `cargo check -p pallet-star-voting --features runtime-benchmarks`) before
+  production use.
 
-To persist chain state between runs, specify a base path by running a command
-similar to the following:
+## Development notes
 
-```sh
-// Create a folder to use as the db base path
-$ mkdir my-chain-state
-
-// Use of that folder to store the chain state
-$ ./target/release/solochain-template-node --dev --base-path ./my-chain-state/
-
-// Check the folder structure created inside the base path after running the chain
-$ ls ./my-chain-state
-chains
-$ ls ./my-chain-state/chains/
-dev
-$ ls ./my-chain-state/chains/dev
-db keystore network
-```
-
-### Connect with Polkadot-JS Apps Front-End
-
-After you start the node template locally, you can interact with it using the
-hosted version of the [Polkadot/Substrate
-Portal](https://polkadot.js.org/apps/#/explorer?rpc=ws://localhost:9944)
-front-end by connecting to the local node endpoint. A hosted version is also
-available on [IPFS](https://dotapps.io/). You can
-also find the source code and instructions for hosting your own instance in the
-[`polkadot-js/apps`](https://github.com/polkadot-js/apps) repository.
-
-### Multi-Node Local Testnet
-
-If you want to see the multi-node consensus algorithm in action, see [Simulate a
-network](https://docs.substrate.io/tutorials/build-a-blockchain/simulate-network/).
-
-## Template Structure
-
-A Substrate project such as this consists of a number of components that are
-spread across a few directories.
-
-### Node
-
-A blockchain node is an application that allows users to participate in a
-blockchain network. Substrate-based blockchain nodes expose a number of
-capabilities:
-
-- Networking: Substrate nodes use the [`libp2p`](https://libp2p.io/) networking
-  stack to allow the nodes in the network to communicate with one another.
-- Consensus: Blockchains must have a way to come to
-  [consensus](https://docs.substrate.io/fundamentals/consensus/) on the state of
-  the network. Substrate makes it possible to supply custom consensus engines
-  and also ships with several consensus mechanisms that have been built on top
-  of [Web3 Foundation
-  research](https://research.web3.foundation/Polkadot/protocols/NPoS).
-- RPC Server: A remote procedure call (RPC) server is used to interact with
-  Substrate nodes.
-
-There are several files in the `node` directory. Take special note of the
-following:
-
-- [`chain_spec.rs`](./node/src/chain_spec.rs): A [chain
-  specification](https://docs.substrate.io/build/chain-spec/) is a source code
-  file that defines a Substrate chain's initial (genesis) state. Chain
-  specifications are useful for development and testing, and critical when
-  architecting the launch of a production chain. Take note of the
-  `development_config` and `testnet_genesis` functions. These functions are
-  used to define the genesis state for the local development chain
-  configuration. These functions identify some [well-known
-  accounts](https://docs.substrate.io/reference/command-line-tools/subkey/) and
-  use them to configure the blockchain's initial state.
-- [`service.rs`](./node/src/service.rs): This file defines the node
-  implementation. Take note of the libraries that this file imports and the
-  names of the functions it invokes. In particular, there are references to
-  consensus-related topics, such as the [block finalization and
-  forks](https://docs.substrate.io/fundamentals/consensus/#finalization-and-forks)
-  and other [consensus
-  mechanisms](https://docs.substrate.io/fundamentals/consensus/#default-consensus-models)
-  such as Aura for block authoring and GRANDPA for finality.
-
-
-### Runtime
-
-In Substrate, the terms "runtime" and "state transition function" are analogous.
-Both terms refer to the core logic of the blockchain that is responsible for
-validating blocks and executing the state changes they define. The Substrate
-project in this repository uses
-[FRAME](https://docs.substrate.io/learn/runtime-development/#frame) to construct
-a blockchain runtime. FRAME allows runtime developers to declare domain-specific
-logic in modules called "pallets". At the heart of FRAME is a helpful [macro
-language](https://docs.substrate.io/reference/frame-macros/) that makes it easy
-to create pallets and flexibly compose them to create blockchains that can
-address [a variety of needs](https://substrate.io/ecosystem/projects/).
-
-Review the [FRAME runtime implementation](./runtime/src/lib.rs) included in this
-template and note the following:
-
-- This file configures several pallets to include in the runtime. Each pallet
-  configuration is defined by a code block that begins with `impl
-  $PALLET_NAME::Config for Runtime`.
-- The pallets are composed into a single runtime by way of the
-  [#[runtime]](https://paritytech.github.io/polkadot-sdk/master/frame_support/attr.runtime.html)
-  macro, which is part of the [core FRAME pallet
-  library](https://docs.substrate.io/reference/frame-pallets/#system-pallets).
-
-### Pallets
-
-The runtime in this project is constructed using many FRAME pallets that ship
-with [the Substrate
-repository](https://github.com/paritytech/polkadot-sdk/tree/master/substrate/frame) and a
-template pallet that is [defined in the
-`pallets`](./pallets/template/src/lib.rs) directory.
-
-A FRAME pallet is comprised of a number of blockchain primitives, including:
-
-- Storage: FRAME defines a rich set of powerful [storage
-  abstractions](https://docs.substrate.io/build/runtime-storage/) that makes it
-  easy to use Substrate's efficient key-value database to manage the evolving
-  state of a blockchain.
-- Dispatchables: FRAME pallets define special types of functions that can be
-  invoked (dispatched) from outside of the runtime in order to update its state.
-- Events: Substrate uses
-  [events](https://docs.substrate.io/build/events-and-errors/) to notify users
-  of significant state changes.
-- Errors: When a dispatchable fails, it returns an error.
-
-Each pallet has its own `Config` trait which serves as a configuration interface
-to generically define the types and parameters it depends on.
-
-## Alternatives Installations
-
-Instead of installing dependencies and building this source directly, consider
-the following alternatives.
-
-### Nix
-
-Install [nix](https://nixos.org/) and
-[nix-direnv](https://github.com/nix-community/nix-direnv) for a fully
-plug-and-play experience for setting up the development environment. To get all
-the correct dependencies, activate direnv `direnv allow`.
-
-### Docker
-
-Please follow the [Substrate Docker instructions
-here](https://github.com/paritytech/polkadot-sdk/blob/master/substrate/docker/README.md) to
-build the Docker container with the Substrate Node Template binary.
+- **Embedded docs**: `cargo +nightly doc --open`
+- **Node CLI help**: `./target/release/solochain-template-node -h`
+- **Polkadot-JS Apps**: connect the running node at
+  `https://polkadot.js.org/apps/#/explorer?rpc=ws://localhost:9944`
+- **Multi-node testnet**: see [Simulate a
+  network](https://docs.polkadot.com/develop/quickstart/#start-a-local-network)
+  in the Polkadot docs.
+- The original template structure docs (node service, chain spec, FRAME
+  primitives) still apply; this repo renamed the template pallet to
+  `pallet-star-voting` and added the runtime wiring described above.
