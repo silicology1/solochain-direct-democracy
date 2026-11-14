@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "90e85a2e1bc66b0b3e90d8b9b39c1c1ac8fa8659"
+  },
+  "path_in_vcs": "substrate/client/executor/wasmtime"
+}
