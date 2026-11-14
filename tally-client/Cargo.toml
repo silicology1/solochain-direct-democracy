@@ -1,0 +1,23 @@
+[package]
+name = "star-voting-tally-client"
+description = "Off-chain STAR tally service for pallet-star-voting"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+
+# Standalone crate: keeps subxt dependencies out of the node's workspace build.
+[workspace]
+
+[dependencies]
+subxt = "0.38"
+subxt-signer = "0.38"
+parity-scale-codec = { version = "3.7.4", features = ["derive"] }
+blake2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+
+[[bin]]
+name = "star-voting-tally"
+path = "src/main.rs"

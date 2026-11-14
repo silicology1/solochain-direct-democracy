@@ -69,7 +69,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     //   `spec_version`, and `authoring_version` are the same between Wasm and native.
     // This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
     //   the compatible custom types.
-    spec_version: 100,
+    spec_version: 101,
     impl_version: 1,
     apis: apis::RUNTIME_API_VERSIONS,
     transaction_version: 1,
@@ -150,6 +150,10 @@ pub type SignedBlock = generic::SignedBlock<Block>;
 pub type BlockId = generic::BlockId<Block>;
 
 /// The `TransactionExtension` to the basic transaction logic.
+///
+/// `SkipCheckIfFeeless` wraps `ChargeTransactionPayment` and skips the fee
+/// entirely for dispatchables marked `#[pallet::feeless_if]` (gasless voting
+/// in `pallet-star-voting`).
 pub type TxExtension = (
     frame_system::CheckNonZeroSender<Runtime>,
     frame_system::CheckSpecVersion<Runtime>,
@@ -158,7 +162,10 @@ pub type TxExtension = (
     frame_system::CheckEra<Runtime>,
     frame_system::CheckNonce<Runtime>,
     frame_system::CheckWeight<Runtime>,
-    pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
+    pallet_skip_feeless_payment::SkipCheckIfFeeless<
+        Runtime,
+        pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
+    >,
     frame_metadata_hash_extension::CheckMetadataHash<Runtime>,
     frame_system::WeightReclaim<Runtime>,
 );
@@ -225,7 +232,11 @@ mod runtime {
     #[runtime::pallet_index(6)]
     pub type Sudo = pallet_sudo;
 
-    // Include the custom logic from the pallet-template in the runtime.
+    // The star voting pallet that powers the direct democracy elections.
     #[runtime::pallet_index(7)]
-    pub type Template = pallet_star_voting;
+    pub type StarVoting = pallet_star_voting;
+
+    // Wraps ChargeTransactionPayment to support feeless (gasless) calls.
+    #[runtime::pallet_index(8)]
+    pub type SkipFeelessPayment = pallet_skip_feeless_payment;
 }

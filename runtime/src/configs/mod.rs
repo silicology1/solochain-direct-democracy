@@ -157,8 +157,18 @@ impl pallet_sudo::Config for Runtime {
     type WeightInfo = pallet_sudo::weights::SubstrateWeight<Runtime>;
 }
 
-/// Configure the pallet-template in pallets/template.
+/// Configure the star-voting pallet in pallets/star-voting.
 impl pallet_star_voting::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type WeightInfo = pallet_star_voting::weights::SubstrateWeight<Runtime>;
+    /// Phase 1: the tally result is submitted by root (sudo). Swap for an
+    /// account/council origin when the tally service has a dedicated key.
+    type TallyOrigin = frame_system::EnsureRoot<AccountId>;
+    type MaxCandidates = ConstU32<1000>;
+    type MaxWinners = ConstU32<500>;
+}
+
+/// Configure the pallet wrapping transaction payment for feeless calls.
+impl pallet_skip_feeless_payment::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
 }

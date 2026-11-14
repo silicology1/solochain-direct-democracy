@@ -1,202 +1,490 @@
-//! # Template Pallet
+//! # Star Voting Pallet
 //!
-//! A pallet with minimal functionality to help developers understand the essential components of
-//! writing a FRAME pallet. It is typically used in beginner tutorials or in Substrate template
-//! nodes as a starting point for creating a new pallet and **not meant to be used in production**.
+//! Multi-winner STAR voting (Score Then Automatic Runoff) for direct democracy.
 //!
 //! ## Overview
 //!
-//! This template pallet contains basic examples of:
-//! - declaring a storage item that stores a single `u32` value
-//! - declaring and using events
-//! - declaring and using errors
-//! - a dispatchable function that allows a user to set a new value to storage and emits an event
-//!   upon success
-//! - another dispatchable function that causes a custom error to be thrown
+//! This pallet stores elections and per-voter ballots on-chain, while the
+//! actual tallying is performed off-chain by a trusted tally service. The
+//! service submits the winning candidates and per-candidate score totals,
+//! and the pallet recomputes a **result hash** on-chain from the submitted
+//! data, binding the on-chain result to the exact payload that was accepted.
 //!
-//! Each pallet section is annotated with an attribute using the `#[pallet::...]` procedural macro.
-//! This macro generates the necessary code for a pallet to be aggregated into a FRAME runtime.
+//! Anyone can fetch the ballots from storage and re-verify the tally
+//! off-chain (see the `tally-client` crate), because the ballots are the
+//! single source of truth stored on-chain.
 //!
-//! Learn more about FRAME macros [here](https://docs.substrate.io/reference/frame-macros/).
+//! ## Score encoding
 //!
-//! ### Pallet Sections
+//! Raw scores live in [-5, +5]. On-chain ballots store
+//! `score_offset = score + 5` in `[0, 10]`, one byte per candidate.
+//! `ABSTAIN_OFFSET (255)` marks a deliberate abstention for that candidate.
 //!
-//! The pallet sections in this template are:
+//! ## Phases
 //!
-//! - A **configuration trait** that defines the types and parameters which the pallet depends on
-//!   (denoted by the `#[pallet::config]` attribute). See: [`Config`].
-//! - A **means to store pallet-specific data** (denoted by the `#[pallet::storage]` attribute).
-//!   See: [`storage_types`].
-//! - A **declaration of the events** this pallet emits (denoted by the `#[pallet::event]`
-//!   attribute). See: [`Event`].
-//! - A **declaration of the errors** that this pallet can throw (denoted by the `#[pallet::error]`
-//!   attribute). See: [`Error`].
-//! - A **set of dispatchable functions** that define the pallet's functionality (denoted by the
-//!   `#[pallet::call]` attribute). See: [`dispatchables`].
+//! An election moves through three phases:
+//! 1. `Voting`    — voters may cast (or not cast) ballots while `block < voting_end`.
+//! 2. `Tallying`  — voting has ended; waiting for the tally service.
+//! 3. `Finalized` — the tally result has been submitted and bound by its hash.
 //!
-//! Run `cargo doc --package pallet-template --open` to view this pallet's documentation.
+//! ## Trust model (Phase 1)
+//!
+//! The chain cannot verify the tally itself without re-running it on-chain.
+//! Instead it provides **transparent verifiability**: `submit_tally` requires
+//! a configured [`Config::TallyOrigin`], and the pallet recomputes
+//! `result_hash = blake2_256(scale-encoded digest)` from the submitted
+//! winners + totals, so the stored hash always binds the stored result.
+//! The result digest is defined by [`compute_result_hash`]; the off-chain
+//! client must replicate its exact SCALE encoding.
 
-// We make sure this pallet uses `no_std` for compiling to Wasm.
 #![cfg_attr(not(feature = "std"), no_std)]
 
-// Re-export pallet items so that they can be accessed from the crate namespace.
 pub use pallet::*;
 
-// FRAME pallets require their own "mock runtimes" to be able to run unit tests. This module
-// contains a mock runtime specific for testing this pallet's functionality.
+extern crate alloc;
+use alloc::vec::Vec;
+
+use codec::Encode;
+use sp_io::hashing::blake2_256;
+
 #[cfg(test)]
 mod mock;
 
-// This module contains the unit tests for this pallet.
-// Learn about pallet unit testing here: https://docs.substrate.io/test/unit-testing/
 #[cfg(test)]
 mod tests;
 
-// Every callable function or "dispatchable" a pallet exposes must have weight values that correctly
-// estimate a dispatchable's execution time. The benchmarking module is used to calculate weights
-// for each dispatchable and generates this pallet's weight.rs file. Learn more about benchmarking here: https://docs.substrate.io/test/benchmark/
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 pub mod weights;
 pub use weights::*;
 
+/// Minimum number of winners an election can declare.
+pub const MIN_WINNERS: u16 = 5;
+/// Maximum number of winners an election can declare.
+pub const MAX_WINNERS: u16 = 500;
+/// Score offset value marking a deliberate abstention for one candidate.
+pub const ABSTAIN_OFFSET: u8 = 255;
+/// Maximum valid score offset (raw score +5).
+pub const MAX_SCORE_OFFSET: u8 = 10;
+
+/// Identifier of an election.
+pub type ElectionId = u32;
+/// Identifier of a candidate inside an election.
+pub type CandidateId = u32;
+
 // All pallet logic is defined in its own module and must be annotated by the `pallet` attribute.
 #[frame_support::pallet]
 pub mod pallet {
-	// Import various useful types required by all FRAME pallets.
 	use super::*;
 	use frame_support::pallet_prelude::*;
 	use frame_system::pallet_prelude::*;
 
-	// The `Pallet` struct serves as a placeholder to implement traits, methods and dispatchables
-	// (`Call`s) in this pallet.
-	#[pallet::pallet]
-	pub struct Pallet<T>(_);
+	/// The current lifecycle phase of an election.
+	#[derive(
+		Clone, Copy, PartialEq, Eq, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebug,
+	)]
+	pub enum Phase {
+		/// Ballots are being accepted.
+		Voting,
+		/// Voting has ended; waiting for the tally result.
+		Tallying,
+		/// The tally result has been submitted.
+		Finalized,
+	}
+
+	/// An election: configuration plus lifecycle state.
+	///
+	/// The ballot format is one `u8` score offset (0..=10, or 255 = abstain)
+	/// per candidate, in the order of `candidates`.
+	#[derive(
+		Clone, PartialEq, Eq, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebugNoBound,
+	)]
+	#[scale_info(skip_type_params(T))]
+	pub struct Election<T: Config> {
+		/// Number of winners to elect (MIN_WINNERS..=MAX_WINNERS).
+		pub winner_count: u16,
+		/// Candidate ids, in ballot-order.
+		pub candidates: BoundedVec<CandidateId, T::MaxCandidates>,
+		/// First block number at which voting is closed.
+		pub voting_end: BlockNumberFor<T>,
+		/// Lifecycle phase.
+		pub phase: Phase,
+	}
+
+	/// The submitted tally result, bound to `result_hash` computed on-chain.
+	#[derive(
+		Clone, PartialEq, Eq, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebugNoBound,
+	)]
+	#[scale_info(skip_type_params(T))]
+	pub struct TallyResult<T: Config> {
+		/// `blake2_256` over the canonical digest of this result (see
+		/// [`compute_result_hash`]); allows off-chain tools to detect any
+		/// tampering with the stored winners/totals.
+		pub result_hash: [u8; 32],
+		/// Winning candidate ids, in ranked order.
+		pub winners: BoundedVec<CandidateId, T::MaxWinners>,
+		/// Total score per candidate (offset-based, abstentions excluded),
+		/// covering every candidate of the election exactly once.
+		pub totals: BoundedVec<(CandidateId, u32), T::MaxCandidates>,
+		/// The account that submitted the result, if the TallyOrigin was a
+		/// signed account (absent for root origins).
+		pub submitted_by: Option<T::AccountId>,
+		/// Block number of the submission.
+		pub submitted_at: BlockNumberFor<T>,
+	}
 
 	/// The pallet's configuration trait.
-	///
-	/// All our types and constants a pallet depends on must be declared here.
-	/// These types are defined generically and made concrete when the pallet is declared in the
-	/// `runtime/src/lib.rs` file of your chain.
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
 		/// The overarching runtime event type.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 		/// A type representing the weights required by the dispatchables of this pallet.
 		type WeightInfo: WeightInfo;
+		/// Origin allowed to submit tally results (e.g. the tally service
+		/// account, a council, or root for early phases).
+		type TallyOrigin: EnsureOrigin<<Self as frame_system::Config>::RuntimeOrigin>;
+		/// Maximum number of candidates in one election.
+		type MaxCandidates: Get<u32>;
+		/// Maximum number of winners in one election (500).
+		type MaxWinners: Get<u32>;
 	}
 
-	/// A storage item for this pallet.
-	///
-	/// In this template, we are declaring a storage item called `Something` that stores a single
-	/// `u32` value. Learn more about runtime storage here: <https://docs.substrate.io/build/runtime-storage/>
-	#[pallet::storage]
-	pub type Something<T> = StorageValue<_, u32>;
+	#[pallet::pallet]
+	pub struct Pallet<T>(_);
 
-	/// Events that functions in this pallet can emit.
-	///
-	/// Events are a simple means of indicating to the outside world (such as dApps, chain explorers
-	/// or other users) that some notable update in the runtime has occurred. In a FRAME pallet, the
-	/// documentation for each event field and its parameters is added to a node's metadata so it
-	/// can be used by external interfaces or tools.
-	///
-	///	The `generate_deposit` macro generates a function on `Pallet` called `deposit_event` which
-	/// will convert the event type of your pallet into `RuntimeEvent` (declared in the pallet's
-	/// [`Config`] trait) and deposit it using [`frame_system::Pallet::deposit_event`].
+	/// Id the next created election will receive.
+	#[pallet::storage]
+	pub type NextElectionId<T> = StorageValue<_, ElectionId, ValueQuery>;
+
+	/// Elections by id.
+	#[pallet::storage]
+	pub type Elections<T: Config> =
+		StorageMap<_, Blake2_128Concat, ElectionId, Election<T>, OptionQuery>;
+
+	/// Ballot of a voter in an election: one score offset per candidate,
+	/// in `Election::candidates` order.
+	#[pallet::storage]
+	pub type Ballots<T: Config> = StorageMap<
+		_,
+		Blake2_128Concat,
+		(ElectionId, T::AccountId),
+		BoundedVec<u8, T::MaxCandidates>,
+		OptionQuery,
+	>;
+
+	/// How many distinct voters have cast a ballot in an election.
+	#[pallet::storage]
+	pub type BallotCount<T: Config> = StorageMap<_, Blake2_128Concat, ElectionId, u32, ValueQuery>;
+
+	/// Submitted tally result per election.
+	#[pallet::storage]
+	pub type Tally<T: Config> =
+		StorageMap<_, Blake2_128Concat, ElectionId, TallyResult<T>, OptionQuery>;
+
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// A user has successfully set a new value.
-		SomethingStored {
-			/// The new value set.
-			something: u32,
-			/// The account who set the new value.
+		/// A new election has been created.
+		ElectionCreated {
+			election_id: ElectionId,
+			winner_count: u16,
+			candidate_count: u32,
+			voting_end: BlockNumberFor<T>,
+		},
+		/// A voter has cast a ballot.
+		VoteCast {
+			election_id: ElectionId,
 			who: T::AccountId,
+		},
+		/// A tally result has been submitted and bound by its hash.
+		TallySubmitted {
+			election_id: ElectionId,
+			result_hash: [u8; 32],
+			winners: Vec<CandidateId>,
 		},
 	}
 
-	/// Errors that can be returned by this pallet.
-	///
-	/// Errors tell users that something went wrong so it's important that their naming is
-	/// informative. Similar to events, error documentation is added to a node's metadata so it's
-	/// equally important that they have helpful documentation associated with them.
-	///
-	/// This type of runtime error can be up to 4 bytes in size should you want to return additional
-	/// information.
 	#[pallet::error]
 	pub enum Error<T> {
-		/// The value retrieved was `None` as no value was previously set.
-		NoneValue,
-		/// There was an attempt to increment the value in storage over `u32::MAX`.
-		StorageOverflow,
+		/// The election does not exist.
+		ElectionNotFound,
+		/// The winner count is outside MIN_WINNERS..=MAX_WINNERS.
+		InvalidWinnerCount,
+		/// The candidate list is longer than MaxCandidates.
+		TooManyCandidates,
+		/// The candidate list is shorter than the winner count.
+		TooFewCandidates,
+		/// The candidate list contains duplicates.
+		DuplicateCandidate,
+		/// The computed voting end overflows the block number type.
+		VotingEndOverflow,
+		/// Ballot attempted on an election that is not in the Voting phase.
+		VotingClosed,
+		/// Voting has not ended yet, so no tally may be submitted.
+		VotingNotEnded,
+		/// The election has already been finalized.
+		AlreadyFinalized,
+		/// The voter already cast a ballot in this election.
+		AlreadyVoted,
+		/// A score offset is not in 0..=10 and not the abstain marker.
+		InvalidScore,
+		/// The ballot does not have exactly one score per candidate.
+		BallotLengthMismatch,
+		/// The submitted winner count does not equal the election's winner count.
+		WinnerCountMismatch,
+		/// A winner is not a candidate of this election, or is duplicated.
+		InvalidWinners,
+		/// The submitted totals do not cover every candidate exactly once.
+		InvalidTotals,
+		/// Arithmetic overflow while computing a total.
+		ArithmeticOverflow,
 	}
 
-	/// The pallet's dispatchable functions ([`Call`]s).
-	///
-	/// Dispatchable functions allows users to interact with the pallet and invoke state changes.
-	/// These functions materialize as "extrinsics", which are often compared to transactions.
-	/// They must always return a `DispatchResult` and be annotated with a weight and call index.
-	///
-	/// The [`call_index`] macro is used to explicitly
-	/// define an index for calls in the [`Call`] enum. This is useful for pallets that may
-	/// introduce new dispatchables over time. If the order of a dispatchable changes, its index
-	/// will also change which will break backwards compatibility.
-	///
-	/// The [`weight`] macro is used to assign a weight to each call.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// An example dispatchable that takes a single u32 value as a parameter, writes the value
-		/// to storage and emits an event.
+		/// Create a new election.
 		///
-		/// It checks that the _origin_ for this call is _Signed_ and returns a dispatch
-		/// error if it isn't. Learn more about origins here: <https://docs.substrate.io/build/origins/>
+		/// - `winner_count` must be within MIN_WINNERS..=MAX_WINNERS.
+		/// - `candidates` must be unique, at least `winner_count` long, and at
+		///   most `MaxCandidates` long.
+		/// - `voting_period` is the number of blocks the voting phase lasts.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::do_something())]
-		pub fn do_something(origin: OriginFor<T>, something: u32) -> DispatchResult {
-			// Check that the extrinsic was signed and get the signer.
-			let who = ensure_signed(origin)?;
+		#[pallet::weight(T::WeightInfo::create_election(candidates.len() as u32))]
+		pub fn create_election(
+			origin: OriginFor<T>,
+			winner_count: u16,
+			candidates: Vec<CandidateId>,
+			voting_period: BlockNumberFor<T>,
+		) -> DispatchResult {
+			let _who = ensure_signed(origin)?;
 
-			// Update storage.
-			Something::<T>::put(something);
+			ensure!(
+				winner_count >= MIN_WINNERS && winner_count <= MAX_WINNERS,
+				Error::<T>::InvalidWinnerCount
+			);
+			ensure!(
+				(candidates.len() as u32) <= T::MaxCandidates::get(),
+				Error::<T>::TooManyCandidates
+			);
+			ensure!(
+				candidates.len() >= winner_count as usize,
+				Error::<T>::TooFewCandidates
+			);
+			// Duplicates would silently break one-byte-per-candidate ballots.
+			let candidates =
+				BoundedVec::try_from(candidates).map_err(|_| Error::<T>::TooManyCandidates)?;
+			let mut sorted = candidates.clone().into_inner();
+			sorted.sort_unstable();
+			sorted.dedup();
+			ensure!(sorted.len() == candidates.len(), Error::<T>::DuplicateCandidate);
 
-			// Emit an event.
-			Self::deposit_event(Event::SomethingStored { something, who });
+			let election_id = NextElectionId::<T>::get();
+			NextElectionId::<T>::put(
+				election_id.checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?,
+			);
 
-			// Return a successful `DispatchResult`
+			let current = frame_system::Pallet::<T>::block_number();
+			let voting_end = current
+				.checked_add(&voting_period)
+				.ok_or(Error::<T>::VotingEndOverflow)?;
+
+			Elections::<T>::insert(
+				election_id,
+				Election { winner_count, candidates, voting_end, phase: Phase::Voting },
+			);
+
+			let candidate_count = sorted.len() as u32;
+			Self::deposit_event(Event::ElectionCreated { election_id, winner_count, candidate_count, voting_end });
+
 			Ok(())
 		}
 
-		/// An example dispatchable that may throw a custom error.
+		/// Cast a ballot in an election.
 		///
-		/// It checks that the caller is a signed origin and reads the current value from the
-		/// `Something` storage item. If a current value exists, it is incremented by 1 and then
-		/// written back to storage.
-		///
-		/// ## Errors
-		///
-		/// The function will return an error under the following conditions:
-		///
-		/// - If no value has been set ([`Error::NoneValue`])
-		/// - If incrementing the value in storage causes an arithmetic overflow
-		///   ([`Error::StorageOverflow`])
+		/// `scores` holds one score offset per candidate (in candidate order):
+		/// a value in `0..=10` (= raw score + 5), or `ABSTAIN_OFFSET` (255) to
+		/// abstain on that candidate. One ballot per voter per election.
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::cause_error())]
-		pub fn cause_error(origin: OriginFor<T>) -> DispatchResult {
-			let _who = ensure_signed(origin)?;
+		#[pallet::weight(T::WeightInfo::vote(scores.len() as u32))]
+		// Gasless voting: casting a ballot never charges a fee. The runtime
+		// must wrap `ChargeTransactionPayment` with
+		// `pallet_skip_feeless_payment::SkipCheckIfFeeless` for this to take
+		// effect.
+		#[pallet::feeless_if(|_origin: &OriginFor<T>, _election_id: &ElectionId, _scores: &Vec<u8>| -> bool {
+			true
+		})]
+		pub fn vote(
+			origin: OriginFor<T>,
+			election_id: ElectionId,
+			scores: Vec<u8>,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
 
-			// Read a value from storage.
-			match Something::<T>::get() {
-				// Return an error if the value has not been set.
-				None => Err(Error::<T>::NoneValue.into()),
-				Some(old) => {
-					// Increment the value read from storage. This will cause an error in the event
-					// of overflow.
-					let new = old.checked_add(1).ok_or(Error::<T>::StorageOverflow)?;
-					// Update the value in storage with the incremented result.
-					Something::<T>::put(new);
-					Ok(())
+			let election = Elections::<T>::get(election_id).ok_or(Error::<T>::ElectionNotFound)?;
+			ensure!(election.phase == Phase::Voting, Error::<T>::VotingClosed);
+			ensure!(
+				frame_system::Pallet::<T>::block_number() < election.voting_end,
+				Error::<T>::VotingClosed
+			);
+			ensure!(
+				scores.len() == election.candidates.len(),
+				Error::<T>::BallotLengthMismatch
+			);
+			ensure!(
+				scores.iter().all(|s| *s <= MAX_SCORE_OFFSET || *s == ABSTAIN_OFFSET),
+				Error::<T>::InvalidScore
+			);
+
+			let scores = BoundedVec::try_from(scores)
+				.map_err(|_| Error::<T>::BallotLengthMismatch)?;
+
+			// One ballot per voter: reject an attempt to vote twice.
+			ensure!(
+				!Ballots::<T>::contains_key((election_id, &who)),
+				Error::<T>::AlreadyVoted
+			);
+
+			let count = BallotCount::<T>::get(election_id);
+			let next = count.checked_add(1).ok_or(Error::<T>::ArithmeticOverflow)?;
+			BallotCount::<T>::insert(election_id, next);
+			Ballots::<T>::insert((election_id, &who), scores);
+
+			Self::deposit_event(Event::VoteCast { election_id, who });
+			Ok(())
+		}
+
+		/// Submit the tally result of an election whose voting phase ended.
+		///
+		/// Requires [`Config::TallyOrigin`]. The pallet recomputes
+		/// `result_hash` from the submitted data (see [`compute_result_hash`])
+		/// and stores it together with the winners and totals, so the stored
+		/// hash always binds the stored result.
+		///
+		/// - `winners` must be exactly `winner_count` unique candidate ids.
+		/// - `totals` must contain exactly one entry per candidate, in any
+		///   order; entries may be `(candidate, 0)` for no votes received.
+		#[pallet::call_index(2)]
+		#[pallet::weight(T::WeightInfo::submit_tally(
+			totals.len() as u32,
+			winners.len() as u32,
+		))]
+		pub fn submit_tally(
+			origin: OriginFor<T>,
+			election_id: ElectionId,
+			winners: Vec<CandidateId>,
+			totals: Vec<(CandidateId, u32)>,
+		) -> DispatchResult {
+			// With a root-based TallyOrigin there is no signer account, so the
+			// submitter is recorded when the origin is signed and `None` for
+			// root.
+			let submitted_by = ensure_signed(origin.clone()).ok();
+			T::TallyOrigin::ensure_origin(origin)?;
+
+			let election = Elections::<T>::get(election_id).ok_or(Error::<T>::ElectionNotFound)?;
+			ensure!(election.phase != Phase::Finalized, Error::<T>::AlreadyFinalized);
+			ensure!(
+				election.phase == Phase::Voting
+					&& frame_system::Pallet::<T>::block_number() >= election.voting_end,
+				Error::<T>::VotingNotEnded
+			);
+
+			// Winners: exactly winner_count unique candidates.
+			ensure!(
+				winners.len() == election.winner_count as usize,
+				Error::<T>::WinnerCountMismatch
+			);
+			ensure!(
+				winners.iter().all(|w| election.candidates.contains(w)),
+				Error::<T>::InvalidWinners
+			);
+			let mut sorted_winners = winners.clone();
+			sorted_winners.sort_unstable();
+			sorted_winners.dedup();
+			ensure!(sorted_winners.len() == winners.len(), Error::<T>::InvalidWinners);
+
+			// Totals: exactly one entry per candidate.
+			ensure!(
+				totals.len() == election.candidates.len(),
+				Error::<T>::InvalidTotals
+			);
+			let mut sorted_totals: Vec<CandidateId> =
+				totals.iter().map(|(c, _)| *c).collect();
+			sorted_totals.sort_unstable();
+			sorted_totals.dedup();
+			ensure!(
+				sorted_totals.len() == election.candidates.len(),
+				Error::<T>::InvalidTotals
+			);
+			ensure!(
+				sorted_totals
+					.iter()
+					.all(|c| election.candidates.contains(c)),
+				Error::<T>::InvalidTotals
+			);
+
+			let winners = BoundedVec::try_from(winners)
+				.map_err(|_| Error::<T>::WinnerCountMismatch)?;
+			let winners_for_event = winners.clone().into_inner();
+			let totals = BoundedVec::try_from(totals).map_err(|_| Error::<T>::InvalidTotals)?;
+
+			let result_hash = compute_result_hash(
+				election_id,
+				election.winner_count,
+				&winners,
+				&totals,
+			);
+
+			let submitted_at = frame_system::Pallet::<T>::block_number();
+			Tally::<T>::insert(
+				election_id,
+				TallyResult {
+					result_hash,
+					winners,
+					totals,
+					submitted_by,
+					submitted_at,
 				},
-			}
+			);
+
+			// Move the election to its final phase.
+			let mut election = election;
+			election.phase = Phase::Finalized;
+			Elections::<T>::insert(election_id, election);
+
+			Self::deposit_event(Event::TallySubmitted {
+				election_id,
+				result_hash,
+				winners: winners_for_event,
+			});
+			Ok(())
 		}
 	}
+
+	impl<T: Config> Pallet<T> {
+		/// The election of `election_id`, if it exists.
+		pub fn election(election_id: ElectionId) -> Option<Election<T>> {
+			Elections::<T>::get(election_id)
+		}
+
+		/// The submitted tally result of `election_id`, if any.
+		pub fn tally(election_id: ElectionId) -> Option<TallyResult<T>> {
+			Tally::<T>::get(election_id)
+		}
+	}
+}
+
+/// The canonical digest of a tally result.
+///
+/// This is the single definition of `result_hash`; both the pallet and the
+/// off-chain `tally-client` must use it. The encoding is plain SCALE of the
+/// tuple
+/// `(election_id: u32, winner_count: u16, winners: Vec<u32>, totals: Vec<(u32, u32)>)`,
+/// hashed with BLAKE2b-256 (`sp_io::hashing::blake2_256`).
+pub fn compute_result_hash(
+	election_id: ElectionId,
+	winner_count: u16,
+	winners: &[CandidateId],
+	totals: &[(CandidateId, u32)],
+) -> [u8; 32] {
+	blake2_256(&(election_id, winner_count, winners, totals).encode())
 }
