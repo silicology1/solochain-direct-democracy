@@ -2,7 +2,7 @@
 name = "pallet-star-voting"
 description = "FRAME pallet template for defining custom runtime logic."
 version = "0.1.0"
-license = "Unlicense"
+license = "AGPL-3.0-only"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true

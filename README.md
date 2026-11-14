@@ -147,3 +147,9 @@ whose `TallyOrigin` accepts signed accounts.
 - The original template structure docs (node service, chain spec, FRAME
   primitives) still apply; this repo renamed the template pallet to
   `pallet-star-voting` and added the runtime wiring described above.
+
+## License
+
+This project is licensed under the [GNU Affero General Public License v3.0](./LICENSE)
+(SPDX: `AGPL-3.0-only`). If you modify and offer it as a network service, you
+must make the modified source available to that service's users.
