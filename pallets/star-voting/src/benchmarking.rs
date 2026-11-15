@@ -75,5 +75,33 @@ mod benchmarks {
 		Ok(())
 	}
 
+	#[benchmark]
+	fn submit_tally_star(c: Linear<5, 1000>) -> Result<(), BenchmarkError> {
+		// Winner count is capped at MAX_WINNERS (500); candidates cover the
+		// whole range of `c` so worst-case sizes are benchmarked.
+		let winner_count = c.min(crate::MAX_WINNERS as u32);
+		let candidates: Vec<CandidateId> = (1..=c).collect();
+		let creator: T::AccountId = whitelisted_caller();
+		Pallet::<T>::create_election(
+			RawOrigin::Signed(creator).into(),
+			winner_count as u16,
+			candidates,
+			10u32.into(),
+		)?;
+
+		// Skip past the voting period so the tally can be submitted.
+		frame_system::Pallet::<T>::set_block_number(20u32.into());
+
+		let winners: Vec<CandidateId> = (1..=winner_count).collect();
+		let totals: Vec<(CandidateId, u32)> = (1..=c).map(|i| (i, 0u32)).collect();
+		let method = TallyMethod::BlocStar;
+
+		#[extrinsic_call]
+		_(RawOrigin::Root, method, 0u32, winners, totals);
+
+		assert_eq!(Tally::<T>::get(0u32).unwrap().method, TallyMethod::BlocStar);
+		Ok(())
+	}
+
 	impl_benchmark_test_suite!(StarVoting, crate::mock::new_test_ext(), crate::mock::Test);
 }

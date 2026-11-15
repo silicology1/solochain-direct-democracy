@@ -18,8 +18,7 @@ use clap::{Parser, Subcommand};
 use subxt_signer::{sr25519::Keypair, SecretUri};
 
 use crate::chain::Chain;
-use crate::digest::compute_result_hash;
-use crate::tally::{tally as star_tally, ABSTAIN_OFFSET};
+use crate::tally::{tally_with_method, TallyMethod, ABSTAIN_OFFSET};
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +33,13 @@ struct Cli {
 	/// Signer secret URI (e.g. "//Alice"). Defaults to //Alice.
 	#[arg(long, global = true, default_value = "//Alice")]
 	seed: String,
+
+	/// Tally method: `score` (top-W by total), `bloc-star` (per-seat
+	/// automatic runoff) or `star-pr` (proportional Allocated Score).
+	/// `tally`/`watch` submit the result bound with the matching on-chain
+	/// digest; `verify` always uses the method stored on-chain.
+	#[arg(long, global = true, default_value = "score")]
+	tally_method: String,
 
 	#[command(subcommand)]
 	command: Command,
@@ -120,7 +126,11 @@ fn signer_from_uri(seed: &str) -> Result<Keypair> {
 }
 
 /// Compute the tally for `election_id` and print it.
-async fn compute_and_print(chain: &Chain, election_id: u32) -> Result<(u16, Vec<u32>, Vec<(u32, u32)>, [u8; 32])> {
+async fn compute_and_print(
+	chain: &Chain,
+	election_id: u32,
+	method: TallyMethod,
+) -> Result<(u16, Vec<u32>, Vec<(u32, u32)>, [u8; 32])> {
 	let election = chain
 		.election(election_id)
 		.await?
@@ -132,24 +142,31 @@ async fn compute_and_print(chain: &Chain, election_id: u32) -> Result<(u16, Vec<
 		election.phase,
 		election.voting_end,
 	);
+	println!("tally method: {}", method.as_str());
 
 	println!("reading ballots from chain...");
 	let ballots = chain.ballots(election_id).await?;
 	println!("got {} ballots", ballots.len());
 
-	let out = star_tally(&election.candidates, &ballots, election.winner_count as usize)?;
+	let out = tally_with_method(method, &election.candidates, &ballots, election.winner_count as usize)?;
 	for (i, w) in out.winners.iter().enumerate() {
 		println!("  {}. candidate {w}", i + 1);
 	}
 
-	let result_hash = compute_result_hash(election_id, election.winner_count, &out.winners, &out.totals);
+	let result_hash = out.result_hash(election_id, election.winner_count, method);
 	println!("result hash: 0x{}", hex::encode(result_hash));
 	Ok((election.winner_count, out.winners, out.totals, result_hash))
 }
 
-async fn cmd_tally(chain: &Chain, seed: &str, id: u32, no_sudo: bool) -> Result<()> {
+async fn cmd_tally(
+	chain: &Chain,
+	seed: &str,
+	id: u32,
+	no_sudo: bool,
+	method: TallyMethod,
+) -> Result<()> {
 	let signer = signer_from_uri(seed)?;
-	let (winner_count, winners, totals, result_hash) = compute_and_print(chain, id).await?;
+	let (winner_count, winners, totals, result_hash) = compute_and_print(chain, id, method).await?;
 
 	if let Some(election) = chain.election(id).await? {
 		let block = chain.block_number().await?;
@@ -166,7 +183,14 @@ async fn cmd_tally(chain: &Chain, seed: &str, id: u32, no_sudo: bool) -> Result<
 	}
 
 	println!("submitting tally result{}...", if no_sudo { "" } else { " via Sudo" });
-	chain.submit_tally(&signer, !no_sudo, id, &winners, &totals).await?;
+	match method {
+		TallyMethod::Score => chain.submit_tally(&signer, !no_sudo, id, &winners, &totals).await?,
+		_ => {
+			chain
+				.submit_tally_star(&signer, !no_sudo, method, id, &winners, &totals)
+				.await?
+		},
+	}
 	println!("done. result hash: 0x{}", hex::encode(result_hash));
 	Ok(())
 }
@@ -178,6 +202,7 @@ async fn cmd_verify(chain: &Chain, id: u32) -> Result<()> {
 		.with_context(|| format!("election {id} has no stored tally"))?;
 
 	println!("stored winners: {:?}", stored.winners);
+	println!("stored method: {}", stored.method.as_str());
 	println!("stored result hash: 0x{}", hex::encode(stored.result_hash));
 
 	let election = chain
@@ -185,11 +210,19 @@ async fn cmd_verify(chain: &Chain, id: u32) -> Result<()> {
 		.await?
 		.with_context(|| format!("election {id} does not exist"))?;
 	let ballots = chain.ballots(id).await?;
-	println!("recomputing tally from {} ballots...", ballots.len());
+	println!(
+		"recomputing tally from {} ballots (method {})...",
+		ballots.len(),
+		stored.method.as_str()
+	);
 
-	let out = star_tally(&election.candidates, &ballots, election.winner_count as usize)?;
-	let recomputed_hash =
-		compute_result_hash(id, election.winner_count, &out.winners, &out.totals);
+	let out = tally_with_method(
+		stored.method,
+		&election.candidates,
+		&ballots,
+		election.winner_count as usize,
+	)?;
+	let recomputed_hash = out.result_hash(id, election.winner_count, stored.method);
 
 	if stored.winners != out.winners {
 		bail!(
@@ -220,18 +253,26 @@ async fn cmd_verify(chain: &Chain, id: u32) -> Result<()> {
 	Ok(())
 }
 
-async fn cmd_watch(chain: &Chain, seed: &str, interval: u64, no_sudo: bool) -> Result<()> {
+async fn cmd_watch(chain: &Chain, seed: &str, interval: u64, no_sudo: bool, method: TallyMethod) -> Result<()> {
 	let signer = signer_from_uri(seed)?;
-	println!("watching for elections to tally (every {interval}s)...");
+	println!(
+		"watching for elections to tally (every {interval}s, method {})...",
+		method.as_str()
+	);
 	loop {
-		if let Err(e) = watch_once(chain, &signer, no_sudo).await {
+		if let Err(e) = watch_once(chain, &signer, no_sudo, method).await {
 			eprintln!("watch iteration failed: {e:#}");
 		}
 		tokio::time::sleep(Duration::from_secs(interval)).await;
 	}
 }
 
-async fn watch_once(chain: &Chain, signer: &Keypair, no_sudo: bool) -> Result<()> {
+async fn watch_once(
+	chain: &Chain,
+	signer: &Keypair,
+	no_sudo: bool,
+	method: TallyMethod,
+) -> Result<()> {
 	// Iterate all elections and tally any whose voting phase has ended and
 	// which have not been finalized yet.
 	let mut iter = chain
@@ -256,7 +297,7 @@ async fn watch_once(chain: &Chain, signer: &Keypair, no_sudo: bool) -> Result<()
 
 		println!("election {election_id} voting ended; tallying...");
 
-		match tally_and_submit(chain, signer, election_id, no_sudo).await {
+		match tally_and_submit(chain, signer, election_id, no_sudo, method).await {
 			Ok(()) => println!("election {election_id} finalized"),
 			Err(e) => eprintln!("tally of election {election_id} failed: {e:#}"),
 		}
@@ -264,7 +305,13 @@ async fn watch_once(chain: &Chain, signer: &Keypair, no_sudo: bool) -> Result<()
 	Ok(())
 }
 
-async fn tally_and_submit(chain: &Chain, signer: &Keypair, election_id: u32, no_sudo: bool) -> Result<()> {
+async fn tally_and_submit(
+	chain: &Chain,
+	signer: &Keypair,
+	election_id: u32,
+	no_sudo: bool,
+	method: TallyMethod,
+) -> Result<()> {
 	let election = chain
 		.election(election_id)
 		.await?
@@ -273,10 +320,23 @@ async fn tally_and_submit(chain: &Chain, signer: &Keypair, election_id: u32, no_
 		bail!("already finalized");
 	}
 	let ballots = chain.ballots(election_id).await?;
-	let out = star_tally(&election.candidates, &ballots, election.winner_count as usize)?;
-	let result_hash =
-		compute_result_hash(election_id, election.winner_count, &out.winners, &out.totals);
-	chain.submit_tally(signer, !no_sudo, election_id, &out.winners, &out.totals).await?;
+	let out = tally_with_method(
+		method,
+		&election.candidates,
+		&ballots,
+		election.winner_count as usize,
+	)?;
+	let result_hash = out.result_hash(election_id, election.winner_count, method);
+	match method {
+		TallyMethod::Score => {
+			chain.submit_tally(signer, !no_sudo, election_id, &out.winners, &out.totals).await?
+		},
+		_ => {
+			chain
+				.submit_tally_star(signer, !no_sudo, method, election_id, &out.winners, &out.totals)
+				.await?
+		},
+	}
 	println!("election {election_id}: result hash 0x{}", hex::encode(result_hash));
 	Ok(())
 }
@@ -284,6 +344,7 @@ async fn tally_and_submit(chain: &Chain, signer: &Keypair, election_id: u32, no_
 #[tokio::main]
 async fn main() -> Result<()> {
 	let cli = Cli::parse();
+	let method = TallyMethod::from_str(&cli.tally_method)?;
 	let chain = Chain::connect(&cli.url).await?;
 
 	match cli.command {
@@ -300,9 +361,11 @@ async fn main() -> Result<()> {
 			let scores = parse_scores(&scores, election.candidates.len())?;
 			chain.vote(&signer, id, &scores).await?;
 		},
-		Command::Tally { id, no_sudo } => cmd_tally(&chain, &cli.seed, id, no_sudo).await?,
+		Command::Tally { id, no_sudo } => cmd_tally(&chain, &cli.seed, id, no_sudo, method).await?,
 		Command::Verify { id } => cmd_verify(&chain, id).await?,
-		Command::Watch { interval, no_sudo } => cmd_watch(&chain, &cli.seed, interval, no_sudo).await?,
+		Command::Watch { interval, no_sudo } => {
+			cmd_watch(&chain, &cli.seed, interval, no_sudo, method).await?
+		},
 	}
 
 	Ok(())

@@ -30,6 +30,8 @@ pub struct ElectionInfo {
 #[derive(Clone, Debug)]
 pub struct StoredTally {
 	pub result_hash: [u8; 32],
+	/// The tally method this result was computed with.
+	pub method: crate::tally::TallyMethod,
 	pub winners: Vec<u32>,
 	pub totals: Vec<(u32, u32)>,
 	pub submitted_by: Option<[u8; 32]>,
@@ -89,6 +91,7 @@ impl Chain {
 		};
 		Ok(Some(StoredTally {
 			result_hash: tally.result_hash,
+			method: method_of(&tally.method),
 			winners: tally.winners.0,
 			totals: tally.totals.0,
 			submitted_by: tally.submitted_by.map(|a| a.0),
@@ -128,9 +131,9 @@ impl Chain {
 		Ok(ballots)
 	}
 
-	/// Submit `StarVoting::submit_tally`, wrapped in `Sudo::sudo` unless
-	/// `use_sudo` is false (for runtimes whose TallyOrigin accepts signed
-	/// accounts).
+	/// Submit `StarVoting::submit_tally` (score method), wrapped in
+	/// `Sudo::sudo` unless `use_sudo` is false (for runtimes whose
+	/// TallyOrigin accepts signed accounts).
 	pub async fn submit_tally(
 		&self,
 		signer: &Keypair,
@@ -147,26 +150,68 @@ impl Chain {
 		let call = api::Call::StarVoting(inner);
 
 		// The two payload types differ, so dispatch in separate branches.
-		let events = if use_sudo {
-			self.client
-				.tx()
-				.sign_and_submit_then_watch_default(&api::tx().sudo().sudo(call), signer)
-				.await?
-				.wait_for_finalized_success()
-				.await?
+		if use_sudo {
+			self.submit_and_wait(&api::tx().sudo().sudo(call), signer).await
 		} else {
 			// Same call dispatched from a signed origin, for runtimes whose
 			// TallyOrigin accepts accounts.
-			self.client
-				.tx()
-				.sign_and_submit_then_watch_default(
-					&api::tx().star_voting().submit_tally(election_id, winners.to_vec(), totals.to_vec()),
-					signer,
-				)
-				.await?
-				.wait_for_finalized_success()
-				.await?
+			self.submit_and_wait(
+				&api::tx().star_voting().submit_tally(election_id, winners.to_vec(), totals.to_vec()),
+				signer,
+			)
+			.await
+		}
+	}
+
+	/// Submit `StarVoting::submit_tally_star` (Bloc STAR / STAR-PR), wrapped
+	/// in `Sudo::sudo` unless `use_sudo` is false.
+	pub async fn submit_tally_star(
+		&self,
+		signer: &Keypair,
+		use_sudo: bool,
+		method: crate::tally::TallyMethod,
+		election_id: u32,
+		winners: &[u32],
+		totals: &[(u32, u32)],
+	) -> Result<()> {
+		let method = star_method_of(method);
+		let inner = api::runtime_types::pallet_star_voting::pallet::Call::submit_tally_star {
+			method: method.clone(),
+			election_id,
+			winners: winners.to_vec(),
+			totals: totals.to_vec(),
 		};
+		let call = api::Call::StarVoting(inner);
+
+		if use_sudo {
+			self.submit_and_wait(&api::tx().sudo().sudo(call), signer).await
+		} else {
+			self.submit_and_wait(
+				&api::tx().star_voting().submit_tally_star(
+					method,
+					election_id,
+					winners.to_vec(),
+					totals.to_vec(),
+				),
+				signer,
+			)
+			.await
+		}
+	}
+
+	/// Sign, submit, and wait for finalization of any payload.
+	async fn submit_and_wait<P: subxt::tx::Payload>(
+		&self,
+		payload: &P,
+		signer: &Keypair,
+	) -> Result<()> {
+		let events = self
+			.client
+			.tx()
+			.sign_and_submit_then_watch_default(payload, signer)
+			.await?
+			.wait_for_finalized_success()
+			.await?;
 		println!(
 			"submitted (extrinsic index {}); tx hash {:?}",
 			events.extrinsic_index(),
@@ -229,6 +274,30 @@ fn phase_string(phase: &api::runtime_types::pallet_star_voting::pallet::Phase) -
 		Phase::Voting => "Voting".into(),
 		Phase::Tallying => "Tallying".into(),
 		Phase::Finalized => "Finalized".into(),
+	}
+}
+
+/// Map the codegen `TallyMethod` to the client enum. Variant order must
+/// match `tally::TallyMethod` (which must match the pallet).
+fn method_of(
+	method: &api::runtime_types::pallet_star_voting::pallet::TallyMethod,
+) -> crate::tally::TallyMethod {
+	use api::runtime_types::pallet_star_voting::pallet::TallyMethod;
+	match method {
+		TallyMethod::Score => crate::tally::TallyMethod::Score,
+		TallyMethod::BlocStar => crate::tally::TallyMethod::BlocStar,
+		TallyMethod::StarPr => crate::tally::TallyMethod::StarPr,
+	}
+}
+
+/// Map the client enum to the codegen `TallyMethod` for call args.
+fn star_method_of(method: crate::tally::TallyMethod)
+-> api::runtime_types::pallet_star_voting::pallet::TallyMethod {
+	use api::runtime_types::pallet_star_voting::pallet::TallyMethod;
+	match method {
+		crate::tally::TallyMethod::Score => TallyMethod::Score,
+		crate::tally::TallyMethod::BlocStar => TallyMethod::BlocStar,
+		crate::tally::TallyMethod::StarPr => TallyMethod::StarPr,
 	}
 }
 

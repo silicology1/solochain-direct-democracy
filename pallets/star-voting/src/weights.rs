@@ -17,6 +17,7 @@ pub trait WeightInfo {
 	fn create_election(c: u32) -> Weight;
 	fn vote(c: u32) -> Weight;
 	fn submit_tally(c: u32, w: u32) -> Weight;
+	fn submit_tally_star(c: u32, w: u32) -> Weight;
 }
 
 /// Weights for pallet_star_voting using the Substrate node and recommended hardware.
@@ -60,6 +61,11 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(1_u64))
 			.saturating_add(T::DbWeight::get().writes(2_u64))
 	}
+	/// Same validation and storage effects as `submit_tally`; the extra
+	/// domain-tag hashing is negligible. Placeholder pending benchmarks.
+	fn submit_tally_star(c: u32, w: u32) -> Weight {
+		Self::submit_tally(c, w)
+	}
 }
 
 // For backwards compatibility and tests
@@ -71,6 +77,9 @@ impl WeightInfo for () {
 		Weight::default()
 	}
 	fn submit_tally(_c: u32, _w: u32) -> Weight {
+		Weight::default()
+	}
+	fn submit_tally_star(_c: u32, _w: u32) -> Weight {
 		Weight::default()
 	}
 }

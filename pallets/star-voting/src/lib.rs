@@ -92,7 +92,25 @@ pub mod pallet {
 		Finalized,
 	}
 
-	/// An election: configuration plus lifecycle state.
+	/// The tally method a submitted result was computed with.
+///
+/// Stored alongside every tally so off-chain verifiers know which algorithm
+/// (and which result-hash digest) to recompute. The SCALE variant order is
+/// part of the digest encoding — do not reorder.
+#[derive(
+	Clone, Copy, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo,
+	RuntimeDebug,
+)]
+pub enum TallyMethod {
+	/// Plain multi-winner score voting: top-W by real signed total.
+	Score,
+	/// Bloc STAR: per seat, top-2 by score, then an automatic runoff.
+	BlocStar,
+	/// STAR-PR (Allocated Score): proportional, sequential ballot allocation.
+	StarPr,
+}
+
+/// An election: configuration plus lifecycle state.
 	///
 	/// The ballot format is one `u8` score offset (0..=10, or 255 = abstain)
 	/// per candidate, in the order of `candidates`.
@@ -118,9 +136,14 @@ pub mod pallet {
 	#[scale_info(skip_type_params(T))]
 	pub struct TallyResult<T: Config> {
 		/// `blake2_256` over the canonical digest of this result (see
-		/// [`compute_result_hash`]); allows off-chain tools to detect any
-		/// tampering with the stored winners/totals.
+		/// [`compute_result_hash`] / [`compute_star_result_hash`]); allows
+		/// off-chain tools to detect any tampering with the stored
+		/// winners/totals.
 		pub result_hash: [u8; 32],
+		/// The tally method this result was computed with. Determines which
+		/// digest function produced `result_hash` and which off-chain
+		/// algorithm verifiers must re-run.
+		pub method: TallyMethod,
 		/// Winning candidate ids, in ranked order.
 		pub winners: BoundedVec<CandidateId, T::MaxWinners>,
 		/// Total score per candidate (offset-based, abstentions excluded),
@@ -199,6 +222,8 @@ pub mod pallet {
 		/// A tally result has been submitted and bound by its hash.
 		TallySubmitted {
 			election_id: ElectionId,
+			/// The tally method the result was computed with.
+			method: TallyMethod,
 			result_hash: [u8; 32],
 			winners: Vec<CandidateId>,
 		},
@@ -236,6 +261,9 @@ pub mod pallet {
 		InvalidWinners,
 		/// The submitted totals do not cover every candidate exactly once.
 		InvalidTotals,
+		/// `submit_tally_star` was called with `TallyMethod::Score`; score
+		/// results must go through `submit_tally`.
+		InvalidTallyMethod,
 		/// Arithmetic overflow while computing a total.
 		ArithmeticOverflow,
 	}
@@ -353,7 +381,8 @@ pub mod pallet {
 			Ok(())
 		}
 
-		/// Submit the tally result of an election whose voting phase ended.
+		/// Submit the tally result of an election whose voting phase ended,
+		/// computed with plain multi-winner score voting.
 		///
 		/// Requires [`Config::TallyOrigin`]. The pallet recomputes
 		/// `result_hash` from the submitted data (see [`compute_result_hash`])
@@ -373,6 +402,44 @@ pub mod pallet {
 			election_id: ElectionId,
 			winners: Vec<CandidateId>,
 			totals: Vec<(CandidateId, u32)>,
+		) -> DispatchResult {
+			Self::do_submit_tally(origin, election_id, winners, totals, TallyMethod::Score)
+		}
+
+		/// Submit a STAR-method tally result (Bloc STAR or STAR-PR) of an
+		/// election whose voting phase ended.
+		///
+		/// Same validation and storage effects as [`Pallet::submit_tally`],
+		/// but the result is bound with the STAR-method digest
+		/// ([`compute_star_result_hash`]) and the stored `method` records
+		/// which STAR algorithm produced it, so verifiers recompute the right
+		/// one. Score-method results must go through `submit_tally`.
+		#[pallet::call_index(3)]
+		#[pallet::weight(T::WeightInfo::submit_tally_star(
+			totals.len() as u32,
+			winners.len() as u32,
+		))]
+		pub fn submit_tally_star(
+			origin: OriginFor<T>,
+			method: TallyMethod,
+			election_id: ElectionId,
+			winners: Vec<CandidateId>,
+			totals: Vec<(CandidateId, u32)>,
+		) -> DispatchResult {
+			ensure!(method != TallyMethod::Score, Error::<T>::InvalidTallyMethod);
+			Self::do_submit_tally(origin, election_id, winners, totals, method)
+		}
+	}
+
+	impl<T: Config> Pallet<T> {
+		/// Shared body of [`Pallet::submit_tally`] and
+		/// [`Pallet::submit_tally_star`].
+		fn do_submit_tally(
+			origin: OriginFor<T>,
+			election_id: ElectionId,
+			winners: Vec<CandidateId>,
+			totals: Vec<(CandidateId, u32)>,
+			method: TallyMethod,
 		) -> DispatchResult {
 			// With a root-based TallyOrigin there is no signer account, so the
 			// submitter is recorded when the origin is signed and `None` for
@@ -427,18 +494,28 @@ pub mod pallet {
 			let winners_for_event = winners.clone().into_inner();
 			let totals = BoundedVec::try_from(totals).map_err(|_| Error::<T>::InvalidTotals)?;
 
-			let result_hash = compute_result_hash(
-				election_id,
-				election.winner_count,
-				&winners,
-				&totals,
-			);
+			let result_hash = match method {
+				TallyMethod::Score => compute_result_hash(
+					election_id,
+					election.winner_count,
+					&winners,
+					&totals,
+				),
+				TallyMethod::BlocStar | TallyMethod::StarPr => compute_star_result_hash(
+					method,
+					election_id,
+					election.winner_count,
+					&winners,
+					&totals,
+				),
+			};
 
 			let submitted_at = frame_system::Pallet::<T>::block_number();
 			Tally::<T>::insert(
 				election_id,
 				TallyResult {
 					result_hash,
+					method,
 					winners,
 					totals,
 					submitted_by,
@@ -453,14 +530,13 @@ pub mod pallet {
 
 			Self::deposit_event(Event::TallySubmitted {
 				election_id,
+				method,
 				result_hash,
 				winners: winners_for_event,
 			});
 			Ok(())
 		}
-	}
 
-	impl<T: Config> Pallet<T> {
 		/// The election of `election_id`, if it exists.
 		pub fn election(election_id: ElectionId) -> Option<Election<T>> {
 			Elections::<T>::get(election_id)
@@ -487,4 +563,38 @@ pub fn compute_result_hash(
 	totals: &[(CandidateId, u32)],
 ) -> [u8; 32] {
 	blake2_256(&(election_id, winner_count, winners, totals).encode())
+}
+
+/// Domain tag separating the STAR-method result digest (Bloc STAR / STAR-PR)
+/// from the plain score digest above. Changing it changes every STAR-method
+/// result hash — both sides must stay in sync.
+pub const STAR_DIGEST_TAG: &[u8] = b"pallet-star-voting/star/1";
+
+/// The canonical digest of a STAR-method (Bloc STAR or STAR-PR) tally result.
+///
+/// Mirrors [`compute_result_hash`] but with a domain tag and the method in
+/// the payload, so a Bloc STAR result can never be confused with a
+/// score-method result:
+///
+/// ```text
+/// result_hash = blake2_256(scale_encode((
+///     tag: &[u8],            // STAR_DIGEST_TAG
+///     method: TallyMethod,   // variant index (BlocStar = 1, StarPr = 2)
+///     election_id: u32, winner_count: u16,
+///     winners: &[u32], totals: &[(u32, u32)],
+/// )))
+/// ```
+///
+/// This is the single definition for both pallet and off-chain client; keep
+/// them in sync.
+pub fn compute_star_result_hash(
+	method: TallyMethod,
+	election_id: ElectionId,
+	winner_count: u16,
+	winners: &[CandidateId],
+	totals: &[(CandidateId, u32)],
+) -> [u8; 32] {
+	blake2_256(
+		&(STAR_DIGEST_TAG, method, election_id, winner_count, winners, totals).encode(),
+	)
 }

@@ -14,8 +14,9 @@ template](https://github.com/paritytech/polkadot-sdk/tree/master/templates/soloc
 voters (feeless)             tally service (off-chain)          chain (sudo)
 ┌───────────────────┐        ┌──────────────────────────┐       ┌──────────────────────┐
 │ StarVoting::vote  │──────▶ │ read Ballots from state  │       │ StarVoting::submit_  │
-│ scores −5..+5     │        │ run STAR tally locally   │─────▶ │ tally(winners,totals)│
-│ or abstain        │        │ (top-W by real total)    │ sudo  │  → recomputes hash   │
+│ scores −5..+5     │        │ run the tally locally    │       │ tally(winners,totals) │
+│ or abstain        │        │ score / bloc STAR /      │ sudo  │  or submit_tally_star │
+│                   │        │ STAR-PR                  │       │  → recomputes hash    │
 └───────────────────┘        └──────────────────────────┘       │  → binds Tally(id)   │
                                                                └──────────────────────┘
                                         anyone: re-derive hash from ballots & compare
@@ -25,12 +26,34 @@ voters (feeless)             tally service (off-chain)          chain (sudo)
   candidate: `raw score + 5` (so `-5..=+5` → `0..=10`), with `255` meaning
   *deliberate abstention*. Abstentions are excluded from both the total and
   the voter count, keeping each voter's score scale comparable.
-- **Tally rule** (Phase 1): candidates are ranked by their *real* signed
-  total `offset_total − 5·voter_count`, not by the offset total; ties are
-  broken by the smaller candidate id. The top `winner_count` candidates win.
+- **Tally methods** (Phase 1): the pallet stores which method a result was
+  computed with (`TallyMethod`: `Score`, `BlocStar`, `StarPr`); anyone
+  verifying must recompute with the stored method. All three share the same
+  score stage: candidates are ranked by their *real* signed total
+  `offset_total − 5·voter_count` (not the offset total), ties broken by the
+  smaller candidate id.
+  - **Score**: the top `winner_count` candidates by real total win.
+  - **Bloc STAR**: per seat, the top-2 remaining candidates by score go to an
+    automatic runoff (each ballot supports the finalist it scored higher;
+    equal scores and double abstentions support neither; an abstain-vs-scored
+    pair supports the scored one; a runoff tie goes to the score-stage
+    leader), the majority winner is seated and removed, repeat.
+  - **STAR-PR** (Allocated Score): proportional. Each voter starts with
+    weight 1; per round the quota is `H = remaining weight / seats left`,
+    candidates are allocated the ballots that scored them *above zero*
+    (highest score first, boundary ballot fractionally) up to `H`, the seat
+    goes to the candidate with the most allocated support (ties → smaller
+    id), and the winner's allocated ballots are spent. When the remaining
+    candidates fill the remaining seats exactly, they are seated in ranked
+    order.
 - **Result binding**: the pallet recomputes, on-chain, over whatever
-  `submit_tally` receives:
-  `result_hash = blake2_256(scale_encode((election_id, winner_count, winners, totals)))`.
+  `submit_tally` (score) / `submit_tally_star` (Bloc STAR / STAR-PR)
+  receives:
+  - score: `result_hash = blake2_256(scale_encode((election_id, winner_count, winners, totals)))`
+  - STAR methods: `result_hash = blake2_256(scale_encode((STAR_DIGEST_TAG, method, election_id, winner_count, winners, totals)))`
+    with domain tag `pallet-star-voting/star/1` and the `TallyMethod`
+    variant index, so a Bloc STAR / STAR-PR result can never be confused
+    with a score result.
   Anyone can independently recompute this from the ballots and compare with
   the stored `Tally.result_hash` — `star-voting-tally verify` does exactly
   that (cross-checked by unit tests on both sides).
@@ -99,14 +122,25 @@ Extrinsics (pallet `StarVoting`):
 
 ### 2. Tally and submit (off-chain client)
 
+Pick the tally method with the global `--tally-method score|bloc-star|star-pr`
+flag (default `score`); place it before the subcommand or anywhere after it:
+
 ```sh
 cargo run --manifest-path tally-client/Cargo.toml -- create --winners 5 --candidates 1,2,3,4,5
 cargo run --manifest-path tally-client/Cargo.toml -- vote 0 --seed //Alice 5,-2,0,a,3   # a = abstain
 cargo run --manifest-path tally-client/Cargo.toml -- vote 0 --seed //Bob   5,5,5,5,5
-cargo run --manifest-path tally-client/Cargo.toml -- tally 0                            # via sudo
+cargo run --manifest-path tally-client/Cargo.toml -- tally 0                            # score, via sudo
+cargo run --manifest-path tally-client/Cargo.toml -- --tally-method bloc-star tally 0   # bloc STAR
+cargo run --manifest-path tally-client/Cargo.toml -- tally 0 --tally-method star-pr    # STAR-PR
 cargo run --manifest-path tally-client/Cargo.toml -- verify 0                           # recompute & check
 cargo run --manifest-path tally-client/Cargo.toml -- watch                              # daemon
 ```
+
+`tally`/`watch` submit through `submit_tally` for `score` and through
+`submit_tally_star` for `bloc-star`/`star-pr`, binding the matching
+domain-separated digest. `verify` ignores the flag and always re-runs the
+method stored on-chain, so a submission can be checked with the exact
+algorithm that produced it.
 
 The client uses subxt **static codegen** compiled from
 [tally-client/artifacts/metadata.scale](./tally-client/README.md#regenerating-artifactsmetadata_scale).
@@ -116,19 +150,21 @@ artifact — the exact procedure is in the
 
 ### Sudo note (Phase 1)
 
-`TallyOrigin` is currently `EnsureRoot`, so `submit_tally` must be wrapped
-in `Sudo::sudo` by the sudo account (`//Alice` on dev chains) — this is the
-default behavior of `tally`/`watch`. Use `tally --no-sudo` for runtimes
-whose `TallyOrigin` accepts signed accounts.
+`TallyOrigin` is currently `EnsureRoot`, so `submit_tally` and
+`submit_tally_star` must be wrapped in `Sudo::sudo` by the sudo account
+(`//Alice` on dev chains) — this is the default behavior of
+`tally`/`watch`. Use `tally --no-sudo` for runtimes whose `TallyOrigin`
+accepts signed accounts.
 
 ## Runtime details
 
 - Pallet indices: `7` = `StarVoting`, `8` = `SkipFeelessPayment` (wraps
   `ChargeTransactionPayment` in the `TxExtension` to honor `feeless_if`).
-- The digest payload (`election_id, winner_count, winners, totals`) is
-  identical on-chain (`pallets/star-voting/src/lib.rs::compute_result_hash`)
-  and off-chain (`tally-client/src/digest.rs`); both sides are pinned by
-  tests against the same vector. Keep them in sync.
+- The digest payloads are identical on-chain
+  (`pallets/star-voting/src/lib.rs::compute_result_hash` and
+  `compute_star_result_hash`) and off-chain (`tally-client/src/digest.rs`);
+  both sides are pinned by tests against the same three vectors (score,
+  Bloc STAR, STAR-PR). Keep them in sync.
 - Weights are hand-estimated placeholders in
   `pallets/star-voting/src/weights.rs`; regenerate from benchmarks
   (`pallets/star-voting/src/benchmarking.rs`,

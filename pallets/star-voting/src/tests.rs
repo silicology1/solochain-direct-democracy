@@ -1,4 +1,7 @@
-use crate::{compute_result_hash, mock::*, ElectionId, Error, Event, Phase, ABSTAIN_OFFSET};
+use crate::{
+	compute_result_hash, compute_star_result_hash, mock::*, ElectionId, Error, Event, Phase,
+	ABSTAIN_OFFSET,
+};
 use frame_support::{assert_noop, assert_ok};
 use frame_system::RawOrigin;
 
@@ -341,6 +344,7 @@ mod submit_tally {
 			assert_eq!(result.winners, winners);
 			assert_eq!(result.totals, totals);
 			assert_eq!(result.submitted_at, 11);
+			assert_eq!(result.method, crate::TallyMethod::Score);
 			assert_eq!(result.result_hash, compute_result_hash(election_id, 5, &winners, &totals));
 
 			assert_eq!(crate::Pallet::<Test>::election(election_id).unwrap().phase, Phase::Finalized);
@@ -348,6 +352,7 @@ mod submit_tally {
 			System::assert_last_event(
 				Event::TallySubmitted {
 					election_id,
+					method: crate::TallyMethod::Score,
 					result_hash: result.result_hash,
 					winners,
 				}
@@ -521,6 +526,164 @@ mod submit_tally {
 			);
 		});
 	}
+}
+
+mod submit_tally_star {
+	use super::*;
+
+	fn submit_star(
+		election_id: ElectionId,
+		method: crate::TallyMethod,
+		winners: Vec<u32>,
+		totals: Vec<(u32, u32)>,
+	) {
+		assert_ok!(crate::Pallet::<Test>::submit_tally_star(
+			RawOrigin::Root.into(),
+			method,
+			election_id,
+			winners,
+			totals,
+		));
+	}
+
+	#[test]
+	fn binds_star_hash_and_records_method() {
+		new_test_ext().execute_with(|| {
+			let election_id = create_election(5, 10);
+			vote(ALICE, election_id, ballot(10, 10));
+			System::set_block_number(11);
+
+			let winners = (5..10).collect::<Vec<u32>>();
+			let totals = expected_totals(&[(ALICE, ballot(10, 10))], 10);
+			submit_star(election_id, crate::TallyMethod::BlocStar, winners.clone(), totals.clone());
+
+			let result = crate::Pallet::<Test>::tally(election_id).unwrap();
+			assert_eq!(result.method, crate::TallyMethod::BlocStar);
+			assert_eq!(
+				result.result_hash,
+				compute_star_result_hash(crate::TallyMethod::BlocStar, election_id, 5, &winners, &totals)
+			);
+			assert_eq!(crate::Pallet::<Test>::election(election_id).unwrap().phase, Phase::Finalized);
+
+			System::assert_last_event(
+				Event::TallySubmitted {
+					election_id,
+					method: crate::TallyMethod::BlocStar,
+					result_hash: result.result_hash,
+					winners,
+				}
+				.into(),
+			);
+		});
+	}
+
+	#[test]
+	fn rejects_score_method() {
+		new_test_ext().execute_with(|| {
+			let election_id = create_election(5, 10);
+			System::set_block_number(11);
+			assert_noop!(
+				crate::Pallet::<Test>::submit_tally_star(
+					RawOrigin::Root.into(),
+					crate::TallyMethod::Score,
+					election_id,
+					candidates(5),
+					expected_totals(&[], 10),
+				),
+				Error::<Test>::InvalidTallyMethod,
+			);
+		});
+	}
+
+	#[test]
+	fn star_hash_differs_from_score_hash() {
+		// Domain separation: the same payload must produce different digests
+		// under the score and STAR-method definitions.
+		let winners = vec![5u32, 4, 3, 2, 1];
+		let totals = expected_totals(&[], 10);
+		assert_ne!(
+			compute_result_hash(0, 5, &winners, &totals),
+			compute_star_result_hash(crate::TallyMethod::BlocStar, 0, 5, &winners, &totals)
+		);
+		assert_ne!(
+			compute_star_result_hash(crate::TallyMethod::BlocStar, 0, 5, &winners, &totals),
+			compute_star_result_hash(crate::TallyMethod::StarPr, 0, 5, &winners, &totals)
+		);
+	}
+
+	#[test]
+	fn rejects_before_voting_ends() {
+		new_test_ext().execute_with(|| {
+			let election_id = create_election(5, 10);
+			System::set_block_number(5);
+			assert_noop!(
+				crate::Pallet::<Test>::submit_tally_star(
+					RawOrigin::Root.into(),
+					crate::TallyMethod::StarPr,
+					election_id,
+					candidates(5),
+					expected_totals(&[], 10),
+				),
+				Error::<Test>::VotingNotEnded,
+			);
+		});
+	}
+
+	#[test]
+	fn rejects_second_submission() {
+		new_test_ext().execute_with(|| {
+			let election_id = create_election(5, 10);
+			System::set_block_number(11);
+			submit_star(election_id, crate::TallyMethod::BlocStar, candidates(5), expected_totals(&[], 10));
+			assert_noop!(
+				crate::Pallet::<Test>::submit_tally_star(
+					RawOrigin::Root.into(),
+					crate::TallyMethod::StarPr,
+					election_id,
+					candidates(5),
+					expected_totals(&[], 10),
+				),
+				Error::<Test>::AlreadyFinalized,
+			);
+		});
+	}
+
+	#[test]
+	fn rejects_non_tally_origin() {
+		new_test_ext().execute_with(|| {
+			let election_id = create_election(5, 10);
+			System::set_block_number(11);
+			assert_noop!(
+				crate::Pallet::<Test>::submit_tally_star(
+					RuntimeOrigin::signed(ALICE),
+					crate::TallyMethod::BlocStar,
+					election_id,
+					candidates(5),
+					expected_totals(&[], 10),
+				),
+				sp_runtime::DispatchError::BadOrigin,
+			);
+		});
+	}
+}
+
+/// Cross-check against the client: prints the STAR-method digests so the
+/// values can be embedded in `tally-client/src/digest.rs`. Run with
+/// `cargo test -p pallet-star-voting star_digest_cross_check -- --nocapture`.
+#[test]
+fn star_digest_cross_check() {
+	let winners = vec![5u32, 4, 3, 2, 1];
+	let totals = vec![(1u32, 0u32), (2, 0), (3, 0), (4, 0), (5, 0)];
+	let bloc = compute_star_result_hash(crate::TallyMethod::BlocStar, 0, 5, &winners, &totals);
+	let pr = compute_star_result_hash(crate::TallyMethod::StarPr, 0, 5, &winners, &totals);
+	println!(
+		"star_digest_cross_check BlocStar result_hash: 0x{}",
+		sp_core::hexdisplay::HexDisplay::from(&bloc)
+	);
+	println!(
+		"star_digest_cross_check StarPr result_hash: 0x{}",
+		sp_core::hexdisplay::HexDisplay::from(&pr)
+	);
 }
 
 mod ballot_totals {
